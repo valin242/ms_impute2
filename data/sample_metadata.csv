@@ -1,0 +1,10 @@
+SampleName,iBAQName,Condition
+Intensity P010693,iBAQ P010693,Colon
+Intensity P010694,iBAQ P010694,Tonsil
+Intensity P010695,iBAQ P010695,Placenta
+Intensity P010738,iBAQ P010738,Liver
+Intensity P010739,iBAQ P010739,Stomach
+Intensity P010740,iBAQ P010740,Lung
+Intensity P013127,iBAQ P013127,Liver
+Intensity P018020,iBAQ P018020,Pituitary
+Intensity P018021,iBAQ P018021,Pituitary

@@ -1,0 +1,387 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Proteomics Data Analysis - Part 1: R Script
+Description: Loads proteomics data, performs QC and normalization, simulates missing data (MCAR, MAR, MNAR), applies initial imputation methods (Mean, Median, kNN, BPCA), and saves datasets as CSV files for Python analysis.
+
+# 1. Load Libraries
+Ensure required packages are installed:
+install.packages(c("BiocManager", "impute", "pcaMethods"))
+BiocManager::install("MSnbase")
+
+```{r}
+library(data.table)
+library(MSnbase)
+library(impute)      # For kNN imputation
+library(pcaMethods)  # For BPCA imputation
+library(stats)       # For median, mean
+library(utils)       # For write.csv
+```
+
+# 2. Configuration
+!!! USER ACTION REQUIRED: Specify paths and parameters !!!
+
+```{r}
+RAW_DATA_FILE <- "data/proteinGroups.csv" # E.g., MaxQuant proteinGroups.csv
+OUTPUT_DIR <- "results/R" # Directory to save CSV files
+SAMPLE_METADATA_FILE <- "data/sample_metadata.txt" # File mapping samples to conditions (optional, for creating MSnSet)
+INTENSITY_COLUMNS_PATTERN <- "Intensity P" # Adjust based on your column names for intensities
+CONTAMINANT_MARKER <- "+" # Marker for contaminants in protein IDs (e.g., from MaxQuant)
+REVERSE_MARKER <- "+" # Marker for reverse sequences (e.g., from MaxQuant)
+
+# Create output directory if it doesn't exist
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR, recursive = TRUE)
+}
+```
+# 3. Import Proteomics Data
+```{r}
+# Read the main data file
+cat("Loading raw data from:", RAW_DATA_FILE, "\n")
+prot_data <- fread(RAW_DATA_FILE)
+
+# Identify intensity columns
+intensity_cols <- grep(INTENSITY_COLUMNS_PATTERN, colnames(prot_data), value = TRUE)
+if (length(intensity_cols) == 0) {
+  stop("No intensity columns found matching the pattern: ", INTENSITY_COLUMNS_PATTERN)
+}
+cat("Found", length(intensity_cols), "intensity columns.\n")
+print(colnames(prot_data))
+```
+```{r}
+# Extract expression matrix (log2 transform often recommended for label-free proteomics)
+# Assuming 0s should be treated as NAs before log transformation
+expr_matrix <- as.matrix(prot_data[, ..intensity_cols])
+expr_matrix[expr_matrix == 0] <- NA
+expr_matrix_log2 <- log2(expr_matrix)
+rownames(expr_matrix_log2) <- prot_data$`Protein IDs` # Or another unique identifier column
+```
+
+# 4. Create MSnSet Object (Optional but Recommended)
+## Requires experimental design/metadata file.
+### Format: A simple text file with sample names (matching intensity columns) and associated conditions/metadata.
+
+Example metadata file (e.g., sample_metadata.txt):
+
+SampleName   Condition
+
+Intensity.Sample1   Control
+
+Intensity.Sample2   Control
+
+Intensity.Sample3   Treatment
+
+Intensity.Sample4   Treatment
+
+
+```{r}
+msnset_obj <- NULL
+if (file.exists(SAMPLE_METADATA_FILE)) {
+  cat("Loading sample metadata from:", SAMPLE_METADATA_FILE, "\n")
+  sample_metadata <- read.delim(SAMPLE_METADATA_FILE, header = TRUE, sep = "\t")
+  
+
+  # Ensure sample names in metadata match intensity column names (after potential cleaning)
+  # cleaned_intensity_cols <- sub(INTENSITY_COLUMNS_PATTERN, "P", intensity_cols) # Example cleaning
+  # print(cleaned_intensity_cols)
+  # if (!all(cleaned_intensity_cols %in% sample_metadata$SampleName)) {
+  #    warning("Mismatch between intensity column names and sample metadata. Trying to proceed but check names.")
+  #    # You might need more sophisticated name matching here
+  # }
+  # # Reorder metadata to match column order
+  # sample_metadata_updated <- sample_metadata[match(cleaned_intensity_cols, sample_metadata$SampleName), ]
+  # View(sample_metadata_updated)
+  # Create PhenoData
+  pdata <- new("AnnotatedDataFrame", data = sample_metadata)
+  rownames(pdata) <- colnames(expr_matrix_log2) # Assign column names of matrix as rownames for PhenoData
+
+  # Create FeatureData (optional, can add protein annotations)
+  fdata <- data.frame(row.names = rownames(expr_matrix_log2))
+  fdata$`Potential contaminant` <- prot_data$`Potential contaminant`
+  fdata$Reverse <- prot_data$Reverse
+  fdata$`Q-value` <- prot_data$`Q-value`
+  fdata$Score <- prot_data$Score
+  # Add more columns from prot_data if needed, e.g., prot_data[, c("Gene names", "Fasta headers")]
+  fdata_df <- new("AnnotatedDataFrame", data = fdata)
+
+  # Create MSnSet object
+  msnset_obj <- new("MSnSet",
+                    exprs = expr_matrix_log2,
+                    phenoData = pdata,
+                    featureData = fdata_df)
+  cat("MSnSet object created.\n")
+
+} else {
+  warning("Sample metadata file not found. Proceeding without MSnSet object. QC and Normalization might be limited.")
+  # Use the log2 matrix directly if no metadata is available
+  expr_data_to_process <- expr_matrix_log2
+}
+```
+
+# --- 5. Quality Control and Data Normalization ---
+```{r}
+if (!is.null(msnset_obj)) {
+  # --- Filtering (using MSnSet) ---
+  # Remove potential contaminants and reverse sequences if markers are present
+  if (!is.null(CONTAMINANT_MARKER) && "Potential contaminant" %in% colnames(prot_data)) {
+      contam_idx <- grep(CONTAMINANT_MARKER, fData(msnset_obj)$`Potential contaminant`, fixed = TRUE)
+      if (length(contam_idx) > 0) {
+          msnset_obj <- msnset_obj[-contam_idx, ]
+          cat("Removed", length(contam_idx), "potential contaminants.\n")
+      }
+  }
+   if (!is.null(REVERSE_MARKER) && "Reverse" %in% colnames(prot_data)) {
+       reverse_idx <- grep(REVERSE_MARKER, fData(msnset_obj)$Reverse, fixed = TRUE)
+        if (length(reverse_idx) > 0) {
+           msnset_obj <- msnset_obj[-reverse_idx, ]
+           cat("Removed", length(reverse_idx), "reverse sequences.\n")
+       }
+   }
+
+  # Filter features (proteins) with too many NAs (e.g., present in < 50% of samples in at least one group)
+  # This is often done BEFORE imputation simulation. Adjust threshold as needed.
+  msnset_obj <- filterNA(msnset_obj, pNA = 0.5) # Example: requires 'Condition' in pData
+
+  # --- Normalization (using MSnSet) ---
+  # Options: "median", "quantiles", "sum", "max", etc. Median or quantile are common.
+  cat("Performing median normalization...\n")
+  msnset_norm <- normalise(msnset_obj, method = "center.median")
+  # Or: msnset_norm <- normalise(msnset_obj, method = "quantiles")
+
+  # Extract the normalized expression matrix
+  expr_norm <- exprs(msnset_norm)
+  cat("Normalization complete.\n")
+
+} else {
+  # --- Normalization (using matrix directly) ---
+  # Basic median centering as an example if MSnSet wasn't created
+  cat("Performing median normalization on the matrix...\n")
+  col_medians <- apply(expr_data_to_process, 2, median, na.rm = TRUE)
+  expr_norm <- sweep(expr_data_to_process, 2, col_medians, "-") # Subtract column medians
+  cat("Normalization complete.\n")
+
+  # Note: Filtering would need to be done manually on the matrix here.
+}
+```
+```{r}
+# Save the clean, normalized data (before introducing missingness)
+clean_norm_file <- file.path(OUTPUT_DIR, "normalized_data_complete.csv")
+write.csv(expr_norm, file = clean_norm_file, row.names = TRUE)
+cat("Saved normalized data to:", clean_norm_file, "\n")
+```
+# 6. Introduce Synthetic Missingness
+```{r}
+# Function to introduce MCAR
+introduce_mcar <- function(data, proportion) {
+  if (proportion == 0) return(data)
+  mat <- data
+  n_total <- length(mat[!is.na(mat)]) # Only consider non-missing values for proportion calculation
+  n_missing <- round(n_total * proportion)
+  if (n_missing == 0 && proportion > 0) {
+      warning("Calculated 0 values to make missing for MCAR proportion ", proportion)
+      return(data)
+  }
+  na_indices <- sample(which(!is.na(mat)), n_missing)
+  mat[na_indices] <- NA
+  return(mat)
+}
+
+# Function to introduce MNAR (based on value intensity)
+# Values below a certain quantile are set to NA
+introduce_mnar <- function(data, proportion) {
+   if (proportion == 0) return(data)
+   mat <- data
+   # Determine the quantile threshold based on non-missing values
+   threshold <- quantile(mat, probs = proportion, na.rm = TRUE)
+   if (is.na(threshold)) {
+       warning("Could not determine MNAR threshold for proportion ", proportion)
+       return(data)
+   }
+   mat[mat < threshold] <- NA
+   return(mat)
+}
+
+# Function to introduce MAR (simplified: missingness depends on row means)
+# Lower mean intensity rows are more likely to have values missing
+# Function to introduce MNAR (based on value intensity)
+# Values below a certain quantile are set to NA
+introduce_mnar <- function(data, proportion) {
+   if (proportion == 0) return(data)
+   mat <- data
+   # Determine the quantile threshold based on non-missing values
+   threshold <- quantile(mat, probs = proportion, na.rm = TRUE)
+   if (is.na(threshold)) {
+       warning("Could not determine MNAR threshold for proportion ", proportion)
+       return(data)
+   }
+   mat[mat < threshold] <- NA
+   return(mat)
+}
+
+# Function to introduce MAR (simplified: missingness depends on row means)
+# Lower mean intensity rows are more likely to have values missing
+introduce_mar <- function(data, proportion) {
+  if (proportion == 0) return(data)
+  mat <- data
+  n_total_obs <- sum(!is.na(mat))
+  target_missing <- round(n_total_obs * proportion)
+  current_missing <- sum(is.na(mat))
+  n_to_add <- target_missing - current_missing
+
+  if (n_to_add <= 0) {
+      # If the data already has enough or more missing values than requested
+      # (e.g., due to MNAR simulation first), just return it.
+      # Or, if proportion is 0.
+      if (proportion > 0) warning("Target MAR missingness already met or exceeded. No MAR values added for proportion ", proportion)
+      return(data)
+  }
+
+  # Calculate row means (excluding existing NAs)
+  row_means <- rowMeans(mat, na.rm = TRUE)
+  # Inverse probability: lower mean -> higher probability of missingness
+  # Add a small epsilon to avoid division by zero if a mean is 0
+  prob_weights <- 1 / (row_means + 1e-6)
+  # Normalize weights
+  prob_weights[is.infinite(prob_weights)] <- max(prob_weights[is.finite(prob_weights)]) * 10 # Handle potential Inf
+  prob_weights[is.na(prob_weights)] <- 0 # Rows with all NAs shouldn't be sampled
+
+  # Get indices of observed values
+  observed_indices <- which(!is.na(mat), arr.ind = TRUE)
+  if (nrow(observed_indices) == 0) {
+      warning("No observed values left to introduce MAR missingness.")
+      return(mat)
+  }
+
+  # Get weights corresponding to each observed value based on its row's mean
+  weights_for_sampling <- prob_weights[observed_indices[, "row"]]
+  weights_for_sampling[is.na(weights_for_sampling)] <- 0 # Ensure no NA weights
+
+   # Check if we have enough valid weights and indices to sample from
+  valid_indices_for_sampling <- which(weights_for_sampling > 0)
+  if (length(valid_indices_for_sampling) < n_to_add) {
+      warning("Not enough valid candidates to introduce the desired number of MAR NAs. Adding as many as possible.")
+      n_to_add <- length(valid_indices_for_sampling)
+  }
+   if(n_to_add <= 0){
+       warning("No values could be selected for MAR.")
+       return(mat)
+   }
+
+  # Sample indices to set to NA, weighted by inverse row mean
+  na_indices_linear <- sample(which(!is.na(mat)), size = n_to_add, prob = weights_for_sampling[valid_indices_for_sampling], replace = FALSE)
+
+  mat[na_indices_linear] <- NA
+  return(mat)
+}
+
+cat("Loaded functions.")
+```
+
+```{r}
+# Generate datasets with different missingness patterns and proportions
+missing_proportions <- c(0.1, 0.2, 0.3) # 10%, 20%, 30%
+missing_types <- c("MCAR", "MNAR", "MAR")
+
+datasets_missing <- list()
+
+for (prop in missing_proportions) {
+  for (type in missing_types) {
+    cat("Generating missing data: Proportion =", prop, ", Type =", type, "\n")
+    dataset_name <- paste0("missing_", type, "_", prop * 100)
+    temp_data <- expr_norm # Start with the clean normalized data
+
+    if (type == "MCAR") {
+      datasets_missing[[dataset_name]] <- introduce_mcar(temp_data, prop)
+    } else if (type == "MNAR") {
+      datasets_missing[[dataset_name]] <- introduce_mnar(temp_data, prop)
+    } else if (type == "MAR") {
+      # Note: This MAR simulation is basic. Real MAR might depend on other variables.
+      datasets_missing[[dataset_name]] <- introduce_mar(temp_data, prop)
+    }
+
+    # Save the dataset with missing values
+    missing_file <- file.path(OUTPUT_DIR, paste0(dataset_name, ".csv"))
+    write.csv(datasets_missing[[dataset_name]], file = missing_file, row.names = TRUE)
+    cat("Saved missing data to:", missing_file, "\n")
+  }
+}
+```
+
+# 7. Apply Multiple Imputation Methods
+
+```{r}
+imputation_methods <- list(
+  "mean" = function(mat) {
+             apply(mat, 2, function(col) {
+               mean_val <- mean(col, na.rm = TRUE)
+               col[is.na(col)] <- mean_val
+               return(col)
+             })
+           },
+  "median" = function(mat) {
+               apply(mat, 2, function(col) {
+                 median_val <- median(col, na.rm = TRUE)
+                 col[is.na(col)] <- median_val
+                 return(col)
+               })
+             },
+  "knn" = function(mat) {
+            # kNN requires samples in columns, features in rows
+            # The impute.knn function returns a list, we need the data part
+            result <- impute.knn(mat, k = 10, rowmax = 0.8, colmax = 0.8, maxp = 1500)
+            return(result$data)
+          },
+  "bpca" = function(mat) {
+             # pcaMethods::pca requires samples in rows, features in columns
+             # Check if data needs transpose
+             if (nrow(mat) < ncol(mat)) {
+                 warning("BPCA: Input matrix has more columns than rows. Consider transposing if samples are in rows.")
+             }
+             # nPcs calculation can be tricky. Start with a reasonable number.
+             max_pcs = min(nrow(mat) - 1, ncol(mat) -1 , 5) # Limit PCs
+             if (max_pcs < 1) max_pcs = 1
+
+             result <- pcaMethods::pca(mat, method = "bpca", nPcs = max_pcs, maxSteps = 100)
+             imputed_data <- completeObs(result)
+             return(imputed_data)
+           }
+)
+
+cat("Loaded imputation methods. \n")
+```
+
+```{r}
+for (dataset_name in names(datasets_missing)) {
+  cat("Imputing dataset:", dataset_name, "\n")
+  original_missing_data <- datasets_missing[[dataset_name]]
+
+  for (method_name in names(imputation_methods)) {
+    cat("  Applying method:", method_name, "\n")
+    impute_func <- imputation_methods[[method_name]]
+    imputed_data <- NULL
+    tryCatch({
+      # Time the imputation
+      start_time <- Sys.time()
+      imputed_data <- impute_func(original_missing_data)
+      end_time <- Sys.time()
+      cat("    Method", method_name, "took:", round(difftime(end_time, start_time, units = "secs"), 2), "seconds\n")
+
+      # Store and save the imputed dataset
+      imputed_dataset_name <- paste0("imputed_", method_name, "_on_", dataset_name)
+      imputed_datasets[[imputed_dataset_name]] <- imputed_data
+
+      imputed_file <- file.path(OUTPUT_DIR, paste0(imputed_dataset_name, ".csv"))
+      write.csv(imputed_data, file = imputed_file, row.names = TRUE)
+      cat("    Saved imputed data to:", imputed_file, "\n")
+
+    }, error = function(e) {
+      cat("    ERROR applying method", method_name, "to dataset", dataset_name, ":", conditionMessage(e), "\n")
+    })
+  }
+}
+
+cat("--- R Script Finished ---\n")
+```
+
