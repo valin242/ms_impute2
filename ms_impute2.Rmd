@@ -4,23 +4,22 @@ output: html_notebook
 ---
 
 # Proteomics Data Analysis - Part 1: R Script
-Description: Loads proteomics data, performs QC and normalization, simulates missing data (MCAR, MAR, MNAR), applies initial imputation methods (Mean, Median, kNN, BPCA), and saves datasets as CSV files for Python analysis.
+
+Description: Loads proteomics data, performs QC and normalization, simulates missing data (MCAR, MAR, MNAR) and saves datasets as CSV files for Python analysis.
 
 # 1. Load Libraries
-Ensure required packages are installed:
-install.packages(c("BiocManager", "impute", "pcaMethods"))
-BiocManager::install("MSnbase")
+
+Ensure required packages are installed: install.packages(c("BiocManager")) BiocManager::install("MSnbase")
 
 ```{r}
 library(data.table)
 library(MSnbase)
-library(impute)      # For kNN imputation
-library(pcaMethods)  # For BPCA imputation
 library(stats)       # For median, mean
 library(utils)       # For write.csv
 ```
 
 # 2. Configuration
+
 !!! USER ACTION REQUIRED: Specify paths and parameters !!!
 
 ```{r}
@@ -36,7 +35,9 @@ if (!dir.exists(OUTPUT_DIR)) {
   dir.create(OUTPUT_DIR, recursive = TRUE)
 }
 ```
+
 # 3. Import Proteomics Data
+
 ```{r}
 # Read the main data file
 cat("Loading raw data from:", RAW_DATA_FILE, "\n")
@@ -50,6 +51,7 @@ if (length(intensity_cols) == 0) {
 cat("Found", length(intensity_cols), "intensity columns.\n")
 print(colnames(prot_data))
 ```
+
 ```{r}
 # Extract expression matrix (log2 transform often recommended for label-free proteomics)
 # Assuming 0s should be treated as NAs before log transformation
@@ -59,22 +61,23 @@ expr_matrix_log2 <- log2(expr_matrix)
 rownames(expr_matrix_log2) <- prot_data$`Protein IDs` # Or another unique identifier column
 ```
 
-# 4. Create MSnSet Object (Optional but Recommended)
+# 4. Create MSnSet Object
+
 ## Requires experimental design/metadata file.
+
 ### Format: A simple text file with sample names (matching intensity columns) and associated conditions/metadata.
 
 Example metadata file (e.g., sample_metadata.txt):
 
-SampleName   Condition
+SampleName TissueSource
 
-Intensity.Sample1   Control
+Intensity.Sample1 Tissue 1
 
-Intensity.Sample2   Control
+Intensity.Sample2 Tissue 1
 
-Intensity.Sample3   Treatment
+Intensity.Sample3 Tissue 2
 
-Intensity.Sample4   Treatment
-
+Intensity.Sample4 Tissue 2
 
 ```{r}
 msnset_obj <- NULL
@@ -120,7 +123,8 @@ if (file.exists(SAMPLE_METADATA_FILE)) {
 }
 ```
 
-# --- 5. Quality Control and Data Normalization ---
+# 5. Quality Control and Data Normalization
+
 ```{r}
 if (!is.null(msnset_obj)) {
   # --- Filtering (using MSnSet) ---
@@ -165,28 +169,31 @@ if (!is.null(msnset_obj)) {
   # Note: Filtering would need to be done manually on the matrix here.
 }
 ```
+
 ```{r}
 # Save the clean, normalized data (before introducing missingness)
 clean_norm_file <- file.path(OUTPUT_DIR, "normalized_data_complete.csv")
 write.csv(expr_norm, file = clean_norm_file, row.names = TRUE)
 cat("Saved normalized data to:", clean_norm_file, "\n")
 ```
+
 # 6. Introduce Synthetic Missingness
+
 ```{r}
 # Function to introduce MCAR
 introduce_mcar <- function(data, proportion) {
   if (proportion == 0) return(data)
   mat <- data
   n_total <- length(mat[!is.na(mat)]) # Only consider non-missing values for proportion calculation
-  n_missing <- round(n_total * proportion)
+  n_missing <- round(n_total * proportion) # Number of missing is proportion of the total
   if (n_missing == 0 && proportion > 0) {
       warning("Calculated 0 values to make missing for MCAR proportion ", proportion)
       return(data)
-  }
-  na_indices <- sample(which(!is.na(mat)), n_missing)
-  mat[na_indices] <- NA
+  } # Catch bad returns
+  na_indices <- sample(which(!is.na(mat)), n_missing) # takes sample from  data = to number of missing
+  mat[na_indices] <- NA # replace those samples with NA
   return(mat)
-}
+} # consider using set.seed(5) to produce same sequence everytime function is ran
 
 # Function to introduce MNAR (based on value intensity)
 # Values below a certain quantile are set to NA
@@ -199,41 +206,92 @@ introduce_mnar <- function(data, proportion) {
        warning("Could not determine MNAR threshold for proportion ", proportion)
        return(data)
    }
-   mat[mat < threshold] <- NA
+   mat[mat < threshold] <- NA # Remove data that is less than threshold
    return(mat)
 }
 
-# Function to introduce MAR (simplified: missingness depends on row means)
-# Lower mean intensity rows are more likely to have values missing
-# Function to introduce MNAR (based on value intensity)
-# Values below a certain quantile are set to NA
-introduce_mnar <- function(data, proportion) {
-   if (proportion == 0) return(data)
-   mat <- data
-   # Determine the quantile threshold based on non-missing values
-   threshold <- quantile(mat, probs = proportion, na.rm = TRUE)
-   if (is.na(threshold)) {
-       warning("Could not determine MNAR threshold for proportion ", proportion)
-       return(data)
-   }
-   mat[mat < threshold] <- NA
-   return(mat)
-}
 
 # Function to introduce MAR (simplified: missingness depends on row means)
 # Lower mean intensity rows are more likely to have values missing
+# introduce_mar <- function(data, proportion) {
+#   if (proportion == 0) return(data)
+#   mat <- data
+#   n_total_obs <- sum(!is.na(mat))
+#   target_missing <- round(n_total_obs * proportion)
+#   current_missing <- sum(is.na(mat))
+#   n_to_add <- target_missing - current_missing
+# 
+#   if (n_to_add <= 0) {
+#       # If the data already has enough or more missing values than requested, just return it.
+#       # Or, if proportion is 0.
+#       if (proportion > 0) warning("Target MAR missingness already met or exceeded. No MAR values added for proportion ", proportion)
+#       return(data)
+#   }
+# 
+#   # Calculate row means (excluding existing NAs)
+#   row_means <- rowMeans(mat, na.rm = TRUE)
+#   # Inverse probability: lower mean -> higher probability of missingness
+#   # Add a small epsilon to avoid division by zero if a mean is 0
+#   prob_weights <- 1 / (row_means + 1e-6)
+#   # Normalize weights
+#   prob_weights[is.infinite(prob_weights)] <- max(prob_weights[is.finite(prob_weights)]) * 10 # Handle potential Inf
+#   prob_weights[is.na(prob_weights)] <- 0 # Rows with all NAs shouldn't be sampled
+# 
+#   # Get indices of observed values
+#   observed_indices <- which(!is.na(mat), arr.ind = TRUE)
+#   if (nrow(observed_indices) == 0) {
+#       warning("No observed values left to introduce MAR missingness.")
+#       return(mat)
+#   }
+#   
+#   # Get the corresponding row index for each observed linear index
+#   observed_row_indices <- row(mat)[observed_indices]
+# 
+#   # Get weights corresponding to each observed value based on its row's mean
+#   weights_for_sampling <- prob_weights[observed_row_indices]
+#   
+#   # Ensure weight_of_sampling has the correct length adn no invalid values
+#   if(length(weights_for_sampling) != length(observed_indices)){
+#       stop("Internal error: Length mismatch between observed indices and weights.")
+#   }
+#   weights_for_sampling[is.na(weights_for_sampling)] <- 0 # Ensure no NA weights
+# 
+#    # Check if we have enough valid weights and indices to sample from
+#   valid_indices_for_sampling <- which(weights_for_sampling > 0)
+#   if (length(valid_indices_for_sampling) < n_to_add) {
+#       warning("Not enough valid candidates to introduce the desired number of MAR NAs. Adding as many as possible.")
+#       n_to_add <- length(valid_indices_for_sampling)
+#   }
+#    if(n_to_add <= 0){
+#        warning("No values could be selected for MAR.")
+#        return(mat)
+#    }
+# 
+#   # Sample indices to set to NA, weighted by inverse row mean
+#   # The population to sample from is observed_linear_indices[valid_candidates_mask]
+#   # The probabilities correspond to weights_for_sampling[valid_candidates_mask]
+#   indices_to_make_na <- sample(
+#     x = observed_indices[valid_indices_for_sampling],
+#     size = n_to_add,
+#     prob = weights_for_sampling[valid_indices_for_sampling],
+#     replace = FALSE
+#   )
+#   
+# 
+#   mat[indices_to_make_na] <- NA
+#   return(mat)
+# }
+
 introduce_mar <- function(data, proportion) {
   if (proportion == 0) return(data)
   mat <- data
   n_total_obs <- sum(!is.na(mat))
-  target_missing <- round(n_total_obs * proportion)
+  target_missing <- round(n_total_obs * proportion) # Target number of NAs based on observed values
   current_missing <- sum(is.na(mat))
-  n_to_add <- target_missing - current_missing
+  n_to_add <- target_missing - current_missing # How many more NAs we need to add
 
   if (n_to_add <= 0) {
       # If the data already has enough or more missing values than requested
-      # (e.g., due to MNAR simulation first), just return it.
-      # Or, if proportion is 0.
       if (proportion > 0) warning("Target MAR missingness already met or exceeded. No MAR values added for proportion ", proportion)
       return(data)
   }
@@ -241,38 +299,61 @@ introduce_mar <- function(data, proportion) {
   # Calculate row means (excluding existing NAs)
   row_means <- rowMeans(mat, na.rm = TRUE)
   # Inverse probability: lower mean -> higher probability of missingness
-  # Add a small epsilon to avoid division by zero if a mean is 0
-  prob_weights <- 1 / (row_means + 1e-6)
-  # Normalize weights
-  prob_weights[is.infinite(prob_weights)] <- max(prob_weights[is.finite(prob_weights)]) * 10 # Handle potential Inf
-  prob_weights[is.na(prob_weights)] <- 0 # Rows with all NAs shouldn't be sampled
+  # Add a small epsilon to avoid division by zero if a mean is 0 or negative (if data not log-transformed properly)
+  prob_weights_rows <- 1 / (row_means + 1e-6)
 
-  # Get indices of observed values
-  observed_indices <- which(!is.na(mat), arr.ind = TRUE)
-  if (nrow(observed_indices) == 0) {
+  # Handle potential Inf/NA/negative weights for rows (e.g., if row_means was 0 or negative)
+  prob_weights_rows[is.infinite(prob_weights_rows)] <- 0 # Set Inf weights to 0 probability
+  prob_weights_rows[is.na(prob_weights_rows)] <- 0      # Set NA weights to 0 probability
+  prob_weights_rows[prob_weights_rows < 0] <- 0        # Set negative weights to 0 probability
+
+  # Get linear indices of all currently observed values
+  observed_linear_indices <- which(!is.na(mat))
+
+  if (length(observed_linear_indices) == 0) {
       warning("No observed values left to introduce MAR missingness.")
       return(mat)
   }
 
-  # Get weights corresponding to each observed value based on its row's mean
-  weights_for_sampling <- prob_weights[observed_indices[, "row"]]
-  weights_for_sampling[is.na(weights_for_sampling)] <- 0 # Ensure no NA weights
+  # Get the corresponding row index for each observed linear index
+  observed_row_indices <- row(mat)[observed_linear_indices]
 
-   # Check if we have enough valid weights and indices to sample from
-  valid_indices_for_sampling <- which(weights_for_sampling > 0)
-  if (length(valid_indices_for_sampling) < n_to_add) {
-      warning("Not enough valid candidates to introduce the desired number of MAR NAs. Adding as many as possible.")
-      n_to_add <- length(valid_indices_for_sampling)
+  # Get the probability weight for each observed value based on its row's weight
+  weights_for_sampling <- prob_weights_rows[observed_row_indices]
+
+  # Ensure weights_for_sampling has the correct length and no invalid values
+  if(length(weights_for_sampling) != length(observed_linear_indices)){
+      stop("Internal error: Length mismatch between observed indices and weights.") # Should not happen
   }
-   if(n_to_add <= 0){
-       warning("No values could be selected for MAR.")
+   weights_for_sampling[is.na(weights_for_sampling)] <- 0 # Final check for NAs
+
+  # Check if there are any valid candidates left to sample from
+  valid_candidates_mask <- weights_for_sampling > 0
+  num_valid_candidates <- sum(valid_candidates_mask)
+
+  if (num_valid_candidates == 0) {
+       warning("No valid candidates (with positive probability) found to introduce MAR missingness for proportion ", proportion)
        return(mat)
-   }
+  }
 
-  # Sample indices to set to NA, weighted by inverse row mean
-  na_indices_linear <- sample(which(!is.na(mat)), size = n_to_add, prob = weights_for_sampling[valid_indices_for_sampling], replace = FALSE)
+  # Adjust n_to_add if it's more than the number of valid candidates
+  if (n_to_add > num_valid_candidates) {
+      warning("Not enough valid candidates to introduce the desired number of MAR NAs (", n_to_add, "). Adding ", num_valid_candidates, " NAs instead for proportion ", proportion)
+      n_to_add <- num_valid_candidates
+  }
 
-  mat[na_indices_linear] <- NA
+  # Sample linear indices from the valid candidates, using their corresponding weights
+  # The population to sample from is observed_linear_indices[valid_candidates_mask]
+  # The probabilities correspond to weights_for_sampling[valid_candidates_mask]
+  indices_to_make_na <- sample(
+      x = observed_linear_indices[valid_candidates_mask],
+      size = n_to_add,
+      prob = weights_for_sampling[valid_candidates_mask],
+      replace = FALSE
+  )
+
+  # Introduce NAs at the sampled indices
+  mat[indices_to_make_na] <- NA
   return(mat)
 }
 
@@ -307,81 +388,6 @@ for (prop in missing_proportions) {
     cat("Saved missing data to:", missing_file, "\n")
   }
 }
+
+cat("Created .csv files with missing datasets.")
 ```
-
-# 7. Apply Multiple Imputation Methods
-
-```{r}
-imputation_methods <- list(
-  "mean" = function(mat) {
-             apply(mat, 2, function(col) {
-               mean_val <- mean(col, na.rm = TRUE)
-               col[is.na(col)] <- mean_val
-               return(col)
-             })
-           },
-  "median" = function(mat) {
-               apply(mat, 2, function(col) {
-                 median_val <- median(col, na.rm = TRUE)
-                 col[is.na(col)] <- median_val
-                 return(col)
-               })
-             },
-  "knn" = function(mat) {
-            # kNN requires samples in columns, features in rows
-            # The impute.knn function returns a list, we need the data part
-            result <- impute.knn(mat, k = 10, rowmax = 0.8, colmax = 0.8, maxp = 1500)
-            return(result$data)
-          },
-  "bpca" = function(mat) {
-             # pcaMethods::pca requires samples in rows, features in columns
-             # Check if data needs transpose
-             if (nrow(mat) < ncol(mat)) {
-                 warning("BPCA: Input matrix has more columns than rows. Consider transposing if samples are in rows.")
-             }
-             # nPcs calculation can be tricky. Start with a reasonable number.
-             max_pcs = min(nrow(mat) - 1, ncol(mat) -1 , 5) # Limit PCs
-             if (max_pcs < 1) max_pcs = 1
-
-             result <- pcaMethods::pca(mat, method = "bpca", nPcs = max_pcs, maxSteps = 100)
-             imputed_data <- completeObs(result)
-             return(imputed_data)
-           }
-)
-
-cat("Loaded imputation methods. \n")
-```
-
-```{r}
-for (dataset_name in names(datasets_missing)) {
-  cat("Imputing dataset:", dataset_name, "\n")
-  original_missing_data <- datasets_missing[[dataset_name]]
-
-  for (method_name in names(imputation_methods)) {
-    cat("  Applying method:", method_name, "\n")
-    impute_func <- imputation_methods[[method_name]]
-    imputed_data <- NULL
-    tryCatch({
-      # Time the imputation
-      start_time <- Sys.time()
-      imputed_data <- impute_func(original_missing_data)
-      end_time <- Sys.time()
-      cat("    Method", method_name, "took:", round(difftime(end_time, start_time, units = "secs"), 2), "seconds\n")
-
-      # Store and save the imputed dataset
-      imputed_dataset_name <- paste0("imputed_", method_name, "_on_", dataset_name)
-      imputed_datasets[[imputed_dataset_name]] <- imputed_data
-
-      imputed_file <- file.path(OUTPUT_DIR, paste0(imputed_dataset_name, ".csv"))
-      write.csv(imputed_data, file = imputed_file, row.names = TRUE)
-      cat("    Saved imputed data to:", imputed_file, "\n")
-
-    }, error = function(e) {
-      cat("    ERROR applying method", method_name, "to dataset", dataset_name, ":", conditionMessage(e), "\n")
-    })
-  }
-}
-
-cat("--- R Script Finished ---\n")
-```
-
